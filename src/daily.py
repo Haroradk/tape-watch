@@ -21,7 +21,7 @@ from pathlib import Path
 import requests
 
 from config import ALLOWED_LATENESS_S, SYMBOLS, get_connection
-from src import reference, rules
+from src import briefing, reference, rules
 from src.bronze import ensure_tables as ensure_bronze
 from src.download import csv_path
 from src.replayer import new_run_id, replay
@@ -141,3 +141,14 @@ def run_day(trade_date: Date, force: bool = False, delete_raw: bool = False) -> 
         for symbol in SYMBOLS:
             csv_path(symbol, trade_date.isoformat()).unlink(missing_ok=True)
     return "completed"
+
+
+def write_briefings(lookback_days: int = 14) -> dict:
+    """Briefings for recent official runs that don't have one yet, newest first, within the LLM budget."""
+    con = get_connection()
+    runs = con.execute("""
+        SELECT trade_date, arg_max(run_id, finished_at) FROM ops.daily_runs
+        WHERE status = 'completed' AND trade_date >= current_date - ?::INTEGER
+        GROUP BY 1
+    """, [lookback_days]).fetchall()
+    return briefing.catch_up(con, runs)

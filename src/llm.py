@@ -29,7 +29,7 @@ def _is_retryable(exception: BaseException) -> bool:
     return isinstance(exception, genai_errors.ClientError) and exception.code == 429
 
 
-@retry(retry=retry_if_exception(_is_retryable), stop=stop_after_attempt(3),
+@retry(retry=retry_if_exception(_is_retryable), stop=stop_after_attempt(2),
        wait=wait_exponential(multiplier=2, min=5, max=60), reraise=True)
 def generate(prompt: str, schema, model: str):
     """Returns an instance of `schema` (a Pydantic model), or None if the model returned nothing parseable."""

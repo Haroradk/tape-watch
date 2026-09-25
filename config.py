@@ -36,10 +36,12 @@ MOTHERDUCK_DATABASE = os.environ.get("MOTHERDUCK_DATABASE", "tape")
 
 # The daily briefing's one LLM call. Free-tier limits are counted per model,
 # and the weather projects use gemini-3.6-flash (agent) and
-# gemini-3.1-flash-lite (ETL) on the same key, so this uses a third model and
-# never competes for their quota.
+# gemini-3.1-flash-lite (ETL) on the same key, so the briefing uses models
+# they don't, and never competes for their quota. Tried in order: the first
+# test found gemini-3.5-flash returning 503 "high demand" while the lite model
+# answered in 2s - and writing up given evidence doesn't need the bigger model.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_BRIEFING_MODEL = os.environ.get("GEMINI_BRIEFING_MODEL", "gemini-3.5-flash")
+GEMINI_BRIEFING_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
 
 
 def get_connection(read_only: bool = False) -> duckdb.DuckDBPyConnection:

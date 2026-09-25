@@ -31,7 +31,7 @@ from typing import List, Literal
 
 from pydantic import BaseModel, Field
 
-from config import ALLOWED_LATENESS_S, GEMINI_API_KEY, GEMINI_BRIEFING_MODEL
+from config import ALLOWED_LATENESS_S, GEMINI_API_KEY, GEMINI_BRIEFING_MODELS
 
 DAILY_CALL_CAP = 3
 
@@ -221,7 +221,6 @@ Pattern = Literal["liquidation_cascade", "large_single_trade", "broad_selling", 
 class IncidentNote(BaseModel):
     incident_no: int
     title: str = Field(description="Plain-language title, at most 12 words, e.g. 'BTC drops 2.1% in four minutes'")
-    scope: Literal["market_wide", "single_asset", "unclear"]
     pattern: Pattern
     narrative: str = Field(description="2-4 sentences explaining what happened, citing numbers from the evidence")
 
@@ -256,13 +255,20 @@ Rules for what you write:
   cannot see news. If the evidence can't tell patterns apart, use pattern "unclear".
 - Describe and explain what happened. Do not recommend trades, give investment advice, or
   predict future prices.
-- Treat incidents on the two coins that overlap in time as one market event where appropriate,
-  and say so.
+- Incidents on the two coins that overlap in time (overlapping_incidents_other_symbol) are one
+  market-wide event: say so in both notes and in the summary.
 - Write one IncidentNote for every incident in the evidence, with the same incident_no.
 
 Evidence (JSON):
 {evidence}
 """
+
+
+def scope_of(incident: dict) -> str:
+    """Market-wide or single asset is a fact the evidence already holds, so SQL
+    decides it, not the model. (The first test briefing noted two incidents
+    overlapped and still labelled both 'single_asset'.)"""
+    return "market_wide" if incident.get("overlapping_incidents_other_symbol") else "single_asset"
 
 
 def validate(briefing: Briefing, evidence: dict) -> list:
@@ -288,17 +294,23 @@ def _calls_today(con) -> int:
     """).fetchone()[0]
 
 
-def _log_call(con, trade_date, status, prompt_chars, output_chars=0, error=None) -> None:
+def _log_call(con, trade_date, model, status, prompt_chars, output_chars=0, error=None) -> None:
     con.execute("""INSERT INTO ops.llm_calls (called_at, trade_date, model, purpose, status, prompt_chars,
                                                output_chars, error)
                    VALUES (?, ?, ?, 'daily_briefing', ?, ?, ?, ?)""",
-                [datetime.utcnow(), trade_date, GEMINI_BRIEFING_MODEL, status, prompt_chars, output_chars,
+                [datetime.utcnow(), trade_date, model, status, prompt_chars, output_chars,
                  (error or "")[:500] or None])
 
 
-def _call_model(prompt: str) -> Briefing:
+def _call_model(con, trade_date, prompt: str):
+    """Try each briefing model in turn. Returns (briefing, model) or (None, None); every attempt is logged."""
     from src import llm  # imported lazily: only needed when there's something to write up
-    return llm.generate(prompt, Briefing, GEMINI_BRIEFING_MODEL)
+    for model in GEMINI_BRIEFING_MODELS:
+        try:
+            return llm.generate(prompt, Briefing, model), model
+        except Exception as e:  # overloaded, quota, timeout: try the next model
+            _log_call(con, trade_date, model, "error", len(prompt), error=repr(e))
+    return None, None
 
 
 def _store(con, trade_date, run_id, status, evidence, briefing: Briefing = None, model=None) -> None:
@@ -328,7 +340,7 @@ def _store(con, trade_date, run_id, status, evidence, briefing: Briefing = None,
         con.execute("""INSERT INTO gold.incident_briefs (trade_date, run_id, incident_no, symbol, title, scope,
                        pattern, narrative, evidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     [trade_date, run_id, inc["incident_no"], inc["symbol"], n.title if n else None,
-                     n.scope if n else None, n.pattern if n else None, n.narrative if n else None,
+                     scope_of(inc), n.pattern if n else None, n.narrative if n else None,
                      json.dumps(inc), now])
     agent_status = "analysed" if briefing else ("awaiting_analyst" if evidence["incidents"] else None)
     if agent_status:
@@ -348,20 +360,18 @@ def write_briefing(con, trade_date: Date, run_id: str) -> str:
         return "awaiting_analyst"
 
     prompt = PROMPT.format(trade_date=trade_date.isoformat(), evidence=json.dumps(evidence, indent=1))
-    try:
-        briefing = _call_model(prompt)
-    except Exception as e:  # quota, outage, bad response: keep the evidence, try again another day
-        _log_call(con, trade_date, "error", len(prompt), error=repr(e))
+    briefing, model = _call_model(con, trade_date, prompt)
+    if model is None:  # every model failed: keep the evidence, a later run catches up
         _store(con, trade_date, run_id, "awaiting_analyst", evidence)
         return "awaiting_analyst"
 
     problems = validate(briefing, evidence) if briefing else ["empty response"]
-    _log_call(con, trade_date, "invalid" if problems else "ok", len(prompt),
+    _log_call(con, trade_date, model, "invalid" if problems else "ok", len(prompt),
               len(briefing.model_dump_json()) if briefing else 0, "; ".join(problems) or None)
     if problems:
         _store(con, trade_date, run_id, "awaiting_analyst", evidence)
         return "awaiting_analyst"
-    _store(con, trade_date, run_id, "written", evidence, briefing, GEMINI_BRIEFING_MODEL)
+    _store(con, trade_date, run_id, "written", evidence, briefing, model)
     return "written"
 
 

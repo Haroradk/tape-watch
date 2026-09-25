@@ -25,8 +25,8 @@ The default day is **2025-10-10**, the big liquidation evening: BTC traded 115k 
 | 3 | YAML rules → alerts → incidents, live on MotherDuck as three processes | done |
 | 3b | Daily reference profile, rules recalibrated on 5 days and checked on 6 unseen days | done |
 | 4 | Daily batch job (GitHub Actions), bronze retention | done |
-| 5 | Daily briefing: SQL evidence per incident + one Gemini call per day | in progress: evidence done, LLM call not yet verified, not wired into the daily job |
-| 6 | Streamlit dashboard, updated daily | |
+| 5 | Daily briefing: SQL evidence per incident + one Gemini call per day | done |
+| 6 | Streamlit dashboard, updated daily | next |
 | 7 | Signal research: do these patterns predict anything? Backtests on history only | |
 
 This is a learning project about the consumption side of market data: detection, explanation, and
@@ -225,6 +225,37 @@ python run_daily.py --date 2026-09-24 --force    # re-run a day
 Setup: add `MOTHERDUCK_TOKEN` as a repository secret (Settings → Secrets and variables → Actions).
 The Actions tab has a "Run workflow" button with date / days / force inputs.
 
+## The daily briefing
+
+After the day is processed, `src/briefing.py` writes the briefing:
+
+- **Evidence, by fixed SQL, per incident:**
+  - the move relative to the price just before it, and where the price was 30 and 60 minutes later
+  - the size versus normal for that hour, for both price and volume
+  - the share of sell-initiated volume
+  - how concentrated the trades were (largest trade and top-10 trades as a share of volume)
+  - what the other coin did, and whether its incidents overlapped
+  - the alert timeline, where negative seconds mean a context alert fired before the price shock
+- **One LLM call per day** with structured output: a headline, a summary, and per incident a title,
+  a pattern from a fixed list (`liquidation_cascade`, `broad_buying`, ...) and a short narrative. The
+  prompt allows only numbers from the evidence, no invented causes, and no trade suggestions or
+  predictions.
+- **Facts come from SQL, interpretation from the model.** Whether an incident is market-wide is
+  decided by the overlap in the evidence, not by the model. In the first test it noted two incidents
+  overlapped and still labelled both `single_asset`.
+- **The answer is untrusted.** The schema guarantees its shape; `validate()` checks its content
+  against the evidence (one note per incident, no invented incident numbers) before it's stored.
+- **Budget.** Every call is logged in `ops.llm_calls`, with at most 3 per day. Quiet days get a
+  written summary without any call. When the budget is spent or the models are unavailable, a day
+  is stored as `awaiting_analyst` with its evidence, and later runs catch it up, newest first.
+- **Models.** `gemini-3.5-flash-lite`, falling back to `gemini-3.5-flash`. Neither is used by the
+  weather projects, and free-tier limits are per model. In the first test, 3.5-flash answered 503
+  "high demand" (and without an HTTP timeout, the job hung), while the lite model answered in 2 s.
+  Writing up evidence it's handed doesn't need the bigger model.
+
+Output: `gold.daily_briefings` (one per day, with the exact evidence the model saw) and
+`gold.incident_briefs` (one per incident).
+
 ## Demo: running live as three processes on MotherDuck
 
 ```
@@ -307,6 +338,8 @@ python -c "from config import get_connection; print(get_connection(read_only=Tru
 config.py            symbols, data URL, default day, allowed lateness, get_connection()
 run_daily.py         the daily job (production): yesterday, or a range of days
 src/daily.py         daily job steps, ops.daily_runs audit log, bronze retention
+src/briefing.py      evidence SQL, prompt + schema, validation, budget guard, catch-up
+src/llm.py           the one Gemini call site (timeout, retries, structured output)
 .github/workflows/daily.yml   runs the daily job on GitHub Actions
 live.py              runs replayer + silver + rules as three processes for one run
 replay.py            CLI: replay a day into bronze
