@@ -1,7 +1,10 @@
-"""Download Binance daily aggTrades files and verify them against their checksums.
+"""Download Binance daily files and verify them against their checksums.
 
-This is the "exchange archive" the replayer reads from. It is not a medallion
-layer: bronze is only what the stream actually delivered.
+Two kinds:
+  aggTrades   every trade - the "exchange archive" the replayer reads from.
+              Not a medallion layer: bronze is only what the stream delivered.
+  klines 1m   Binance's own 1-minute candles - small reference data, used to
+              build the rules' daily reference profile (src/reference.py).
 """
 
 import hashlib
@@ -10,7 +13,7 @@ from pathlib import Path
 
 import requests
 
-from config import BINANCE_DATA_URL, RAW_DIR
+from config import BINANCE_DATA_URL, BINANCE_KLINES_URL, RAW_DIR
 
 
 def _sha256(path: Path) -> str:
@@ -25,16 +28,28 @@ def csv_path(symbol: str, date: str) -> Path:
     return RAW_DIR / symbol / f"{symbol}-aggTrades-{date}.csv"
 
 
+def klines_path(symbol: str, date: str) -> Path:
+    return RAW_DIR / "klines_1m" / symbol / f"{symbol}-1m-{date}.csv"
+
+
 def download_day(symbol: str, date: str) -> Path:
-    """Fetch, verify and unzip one symbol-day. Idempotent: skips if the CSV exists."""
-    target = csv_path(symbol, date)
+    """Fetch, verify and unzip one symbol-day of aggTrades. Idempotent."""
+    return _fetch(csv_path(symbol, date), f"{BINANCE_DATA_URL}/{symbol}/{symbol}-aggTrades-{date}.zip")
+
+
+def download_klines(symbol: str, date: str) -> Path:
+    """Fetch, verify and unzip one symbol-day of 1-minute klines. Idempotent."""
+    return _fetch(klines_path(symbol, date), f"{BINANCE_KLINES_URL}/{symbol}/1m/{symbol}-1m-{date}.zip", quiet=True)
+
+
+def _fetch(target: Path, url: str, quiet: bool = False) -> Path:
     if target.exists():
-        print(f"  {symbol} {date}: already downloaded")
+        if not quiet:
+            print(f"  {target.name}: already downloaded")
         return target
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    name = f"{symbol}-aggTrades-{date}.zip"
-    url = f"{BINANCE_DATA_URL}/{symbol}/{name}"
+    name = url.rsplit("/", 1)[1]
     zip_path = target.parent / name
 
     expected = requests.get(url + ".CHECKSUM", timeout=30)
@@ -55,5 +70,6 @@ def download_day(symbol: str, date: str) -> Path:
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(target.parent)
     zip_path.unlink()
-    print(f"  {symbol} {date}: downloaded, checksum ok, {target.stat().st_size / 1e6:.0f} MB")
+    if not quiet:
+        print(f"  {target.name}: downloaded, checksum ok, {target.stat().st_size / 1e6:.0f} MB")
     return target

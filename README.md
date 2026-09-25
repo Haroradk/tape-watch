@@ -1,8 +1,8 @@
 # tape-watch
 
-A learning project: replay a real day of crypto trades as if it were a live feed, detect unusual
-market moves with simple rules, group them into incidents, and (next) wake an LLM agent only when
-an incident opens, to explain what happened. Think market surveillance desk, or an observability platform where the
+A learning project: replay real days of crypto trades as if they were a live feed, detect unusual
+market moves with simple rules, group them into incidents, and have an LLM write a daily briefing
+explaining what happened. Think market surveillance desk, or an observability platform where the
 metrics are trades.
 
 The agent explains moves; it never suggests trades.
@@ -23,8 +23,14 @@ The default day is **2025-10-10**, the big liquidation evening: BTC traded 115k 
 | 1 | Download + checksum, replayer, bronze | done |
 | 2 | Silver 1s/1m bars (windowing, watermarks, late events) | done |
 | 3 | YAML rules → alerts → incidents, live on MotherDuck as three processes | done |
-| 4 | Gemini agent per incident, read-only SQL, daily budget guard | next |
-| 5 | Streamlit dashboard | |
+| 3b | Daily reference profile, rules recalibrated on 5 days and checked on 6 unseen days | done |
+| 4 | Daily batch job (GitHub Actions), bronze retention | next |
+| 5 | Daily briefing: SQL evidence per incident + one Gemini call per day | |
+| 6 | Streamlit dashboard, updated daily | |
+| 7 | Signal research: do these patterns predict anything? Backtests on history only | |
+
+This is a learning project about the consumption side of market data: detection, explanation, and
+later signal research. It never places or recommends trades.
 
 ## How the stream works
 
@@ -100,52 +106,83 @@ exactly (0 / 80 different).
 
 ## Rules and incidents
 
-`rules.yml` defines three surveillance rules over per-second features, computed on a dense 1-second
-series per symbol against a rolling 30-minute baseline (10-minute warm-up before anything can fire):
+`rules.yml` defines three surveillance rules over per-second features. Conditions are pandas
+expressions, so thresholds are tuned in YAML, not code, and the exact YAML each evaluation used is
+stored in `ops.rule_runs`.
 
-| Rule | Fires when | Severity |
+| Rule | Fires when | Role |
 |---|---|---|
-| `price_shock` | 60 s return is more than 4 standard deviations from normal | high |
-| `volume_burst` | last minute's volume is more than 5x the normal minute | medium |
-| `one_sided_flow` | over 120 s, >80% of volume is sell-initiated (or <20%), on above-normal volume | medium |
+| `price_shock` | the 60 s move is over 10x the typical 1-minute move *at this hour of day* | **opens incidents** |
+| `volume_burst` | the last minute's volume is over 20x the typical minute at this hour | context |
+| `one_sided_flow` | over 120 s, >80% of volume is one-sided, on 10x typical volume | context |
 
-Conditions are pandas expressions over the features, so thresholds are tuned in YAML, not code. The
-exact YAML each evaluation used is stored in `ops.rule_runs`.
+"Typical at this hour" comes from the **daily reference profile** (`src/reference.py`): per symbol and
+hour of day, the median 1-minute volume and the typical size of a 1-minute return over the previous
+7 days, built from Binance's official 1-minute candles (`reference.klines_1m`). It's rebuilt once a
+day and never uses the day being scored, because a reference that has seen the day would leak the
+answer into any later backtest. It's the desk version of "percent of ADV at this point in the
+intraday volume curve". Normal BTC volume at 16:00 UTC is ~4x normal volume at 22:00.
 
 Three layers, the same shape as an observability stack:
 
-- **Alerts** (`ops.alerts`) are edge-triggered. A rule *fires* when its condition goes false → true,
-  and *clears* only after 60 s of being false. One alert per episode, not one per second.
-- **Incidents** (`ops.incidents`). Alerts on a symbol join its open incident, or open a new one. An
-  incident resolves after 5 minutes with no rule active. `ops.incident_events` is the append-only
-  timeline (opened / alert / resolved) that the agent will consume in phase 4.
-- **Two times on everything.** `fired_at` / `opened_at` is the market second it happened;
-  `detected_at` is when the pipeline knew, on the replay's clock. The gap is detection delay.
+- **Alerts** (`ops.alerts`) are edge-triggered: a rule *fires* when its condition goes false → true
+  and *clears* after 60 s of being false. Every alert is kept, including context alerts that never
+  joined an incident. The signal-research phase needs the alerts that led nowhere too.
+- **Incidents** (`ops.incidents`). Only the symptom, price moving, opens an incident. Context alerts
+  attach to the symbol's open incident, or to one that opens within 5 minutes after them, so "volume
+  moved before price" lands in the evidence. An incident resolves after 15 minutes without a price
+  shock. `ops.incident_events` is the append-only timeline.
+- **Two times on everything.** `fired_at` / `opened_at` is the market second; `detected_at` is when
+  the pipeline knew, on the replay's clock. `price_at_open` is the price *before* the move (60 s
+  before the shock fired), otherwise the move that opened the incident is left out of its own size.
 
-### What the crash evening produces
+### How the thresholds were chosen
 
-20:00–22:00 UTC, BTC and ETH: 14,400 symbol-seconds evaluated, **21 alerts, 5 incidents**. That's the
-alert manager's job in numbers: 21 alerts would be 21 pages; grouped, it's 5 things to look at, which
-fits the agent's free-tier budget (about 20 LLM calls a day).
+The first version compared everything to the **previous 30 minutes**. On a full ordinary day that
+gave 108–132 incidents, *more* than the crash day's 104, and the quiet Saturday was the noisiest.
+Relative to a quiet half hour, a 0.09% move is "4 sigma". Only 0–2 of those incidents per ordinary day
+moved the price 1% or more. Tightening that version still left 59–81 incidents a day.
 
-| # | Symbol | Opened | Lasted | Alerts | Rules (in order) | Low vs open | Max z | Max volume |
-|---:|---|---|---:|---:|---|---:|---:|---:|
-| 1 | BTC | 20:44:12 | 24 min | 6 | volume_burst, one_sided_flow, volume_burst, then 3x price_shock | −3.5% | 13.8 | 68x |
-| 2 | ETH | 20:50:08 | 21 min | 5 | price_shock, volume_burst, 3x price_shock | −3.7% | 13.0 | 47x |
-| 3 | ETH | 21:12:35 | 16 min | 4 | volume_burst, price_shock, volume_burst, price_shock | −8.8% | 7.4 | 9x |
-| 4 | BTC | 21:13:07 | 13 min | 5 | price_shock, volume_burst, price_shock, price_shock, volume_burst | −9.0% | 11.0 | 13x |
-| 5 | ETH | 21:56:52 | open | 1 | price_shock | −2.8% | 5.2 | 4x |
+The second version compares to the daily reference, and calibration showed the rules behave very
+differently:
 
-Things worth noticing:
+- `price_shock` separates days cleanly.
+- `volume_burst` still fires 6–7 times on a normal weekday even at 30x (crypto volume is spiky:
+  one large order does it).
+- `one_sided_flow` never once marked a move of 1% or more, at any threshold.
 
-- **Volume led price.** Incident 1 opened on a volume burst 6 minutes before the first price shock.
-- **Incidents come in pairs.** BTC and ETH open within seconds to minutes of each other (1/2, 3/4).
-  Incidents are per symbol, so "is this market-wide?" is left as the first question for the agent.
-- **`one_sided_flow` barely fired** (1 of 21 alerts), even in a crash. Even heavy sell-offs rarely
-  keep 80% of volume on one side for two full minutes, so the threshold is likely too strict. Tuning
-  it is a rules.yml change.
-- **Deterministic.** Offline and three separate live runs all produced the same 21 alerts and
-  5 incidents. Only detection times differ, because those depend on how the processes ran.
+So the volume and flow rules became context, not incident openers.
+
+Calibrated on 5 days, then checked on 6 days the thresholds had never seen:
+
+| Day | Set | Alerts | Incidents | Incidents (largest move from pre-shock price) |
+|---|---|---:|---:|---|
+| Thu 2025-09-18 | unseen | 10 | 1 | BTC 23:00 0.3% |
+| Wed 2025-09-24 | calibration | 20 | 3 | ETH 04:11 0.9%, BTC 04:11 0.5%, ETH 21:58 0.6% |
+| Sat 2025-09-27 | unseen | 3 | 0 | |
+| Wed 2025-10-01 | calibration | 47 | 2 | ETH 08:36 3.2%, BTC 08:46 0.9% |
+| Thu 2025-10-02 | unseen | 31 | 0 | |
+| Sat 2025-10-04 | calibration | 6 | 0 | |
+| Mon 2025-10-06 | unseen | 17 | 0 | (BTC all-time high: a steady climb, no shocks) |
+| Tue 2025-10-07 | calibration | 20 | 2 | ETH 15:07 0.9%, ETH 23:50 0.6% |
+| Wed 2025-10-08 | unseen | 17 | 0 | |
+| **Fri 2025-10-10** | calibration | 112 | 5 | ETH 15:30 2.1%, ETH 19:28 1.5%, **ETH 20:50 −14.4% and BTC 20:50 −12.5% (~3 h each)**, ETH 23:47 2.3% |
+| Sat 2025-10-11 | unseen | 32 | 3 | aftershocks: ETH 00:03 0.8%, ETH 02:06 0.9%, BTC 07:00 1.2% |
+
+Ordinary days: 0–3 incidents, and 4 of the 5 unseen ordinary days had none. The crash is now one
+incident per coin instead of a dozen fragments. The day after the crash still produced incidents even
+though its 7-day reference includes the crash, which makes "normal" wider, so aftershocks had to be
+genuinely large.
+
+Known limitation: the reference steps at each hour boundary. Checked on the unseen days, it rarely
+matters (a shock at 07:00:32 scores 10.5 against the 07:00 hour and 10.2 against 06:00), but
+interpolating between adjacent hours would remove it.
+
+**Data-quality check for free:** our 1-minute bars (built from raw trades) match Binance's own candles
+exactly (open, high, low, close, volume and buy volume) for every minute of the day. The first
+comparison found one mismatch per coin, at 23:59: the day had been replayed with `--end 23:59:59`,
+and since the window end is exclusive, the last second's trades were dropped. Full days now use
+`--end 24:00`.
 
 ## Running live: three processes on MotherDuck
 
@@ -161,7 +198,7 @@ allows one writing process. Each follower keeps its working state in local memor
 the rules engine's rolling buffers and rule states) and writes only finished output, because every
 warehouse call is a network round trip.
 
-Detection delay, live at 60x: **median 26 simulated seconds, max 87**, against a floor of 11 s
+Detection delay, live at 60x (measured with the first version of the rules): **median 26 simulated seconds, max 87**, against a floor of 11 s
 (10 s allowed lateness + the 1 s bar, which is what an offline evaluation shows). The rest is
 processing lag: roughly 0.2–1.3 s of wall-clock time for poll → write → poll → write, multiplied by
 the 60x speed-up. At 1x the same pipeline would detect in about 12 s. Speeding up a replay magnifies
@@ -225,7 +262,7 @@ python -c "from config import get_connection; print(get_connection(read_only=Tru
 config.py            symbols, data URL, default day, allowed lateness, get_connection()
 live.py              runs replayer + silver + rules as three processes for one run
 replay.py            CLI: replay a day into bronze
-src/download.py      fetch daily zip + .CHECKSUM, verify sha256, unzip
+src/download.py      fetch daily aggTrades / 1m klines zip + .CHECKSUM, verify sha256, unzip
 src/replayer.py      simulated clock, late-event injection, micro-batch inserts, reconciliation
 src/bronze.py        bronze.replay_runs and bronze.trade_events DDL
 build_silver.py      CLI: build silver bars for a run at a given allowed lateness
@@ -233,5 +270,6 @@ src/silver.py        watermark bar builder (local state), offline build + live f
 rules.yml            rule definitions, baseline settings, incident grouping
 run_rules.py         CLI: evaluate rules offline, or --follow live
 src/rules.py         features, rule engine (edge-triggered alerts), incident manager, ops DDL
+src/reference.py     daily reference profile from Binance 1m klines; bars-vs-klines reconciliation
 scripts/lateness_experiment.py   lateness sweep vs hindsight truth
 ```

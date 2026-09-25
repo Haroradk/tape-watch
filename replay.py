@@ -4,11 +4,11 @@ Examples:
   python replay.py                                   # 20:00-22:00 UTC on the crash day, 60x
   python replay.py --speed 0                         # backfill as fast as possible
   python replay.py --late-fraction 0.01              # 1% of trades arrive late (30s on average)
-  python replay.py --start 00:00 --end 23:59:59 --speed 600
+  python replay.py --start 00:00 --end 24:00 --speed 0 --tick 10   # a full day, as the daily job runs it
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import DEFAULT_DATE, SYMBOLS
 from src.replayer import replay
@@ -19,7 +19,7 @@ def main() -> None:
     p.add_argument("--date", default=DEFAULT_DATE, help="trading day, YYYY-MM-DD (UTC)")
     p.add_argument("--symbols", nargs="+", default=SYMBOLS)
     p.add_argument("--start", default="20:00", help="window start, HH:MM[:SS] UTC")
-    p.add_argument("--end", default="22:00", help="window end, HH:MM[:SS] UTC")
+    p.add_argument("--end", default="22:00", help="window end (exclusive), HH:MM[:SS] UTC; 24:00 = end of day")
     p.add_argument("--speed", type=float, default=60.0, help="sim seconds per wall second; 0 = as fast as possible")
     p.add_argument("--tick", type=float, default=0.5, help="seconds between micro-batches")
     p.add_argument("--late-fraction", type=float, default=0.0, help="share of trades that arrive late")
@@ -28,6 +28,10 @@ def main() -> None:
     a = p.parse_args()
 
     def at(hms: str) -> datetime:
+        # The window end is exclusive, so a full day must end at the next
+        # midnight - "23:59:59" silently drops the last second's trades.
+        if hms == "24:00":
+            return datetime.strptime(a.date, "%Y-%m-%d") + timedelta(days=1)
         fmt = "%Y-%m-%d %H:%M:%S" if hms.count(":") == 2 else "%Y-%m-%d %H:%M"
         return datetime.strptime(f"{a.date} {hms}", fmt)
 

@@ -14,6 +14,7 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 # https://github.com/binance/binance-public-data
 # Daily files appear the day after; each .zip has a sibling .CHECKSUM (sha256).
 BINANCE_DATA_URL = "https://data.binance.vision/data/spot/daily/aggTrades"
+BINANCE_KLINES_URL = "https://data.binance.vision/data/spot/daily/klines"
 
 # 2025-10-10 is the big crypto liquidation day (evening UTC) - a day where the
 # rules engine will definitely have something to find.

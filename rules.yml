@@ -5,42 +5,56 @@
 # are conditions over those features - pandas expressions, so thresholds can
 # be tuned here without touching code.
 #
-# Features (all computed per second t):
-#   ret_60            price return over the last 60s: close_t / close_(t-60) - 1
-#   ret_60_z          ret_60 divided by the std of ret_60 over the baseline window
-#   vol_60            base-asset volume traded in the last 60s
-#   vol_60_ratio      vol_60 / median vol_60 over the baseline window
-#   sell_share_120    share of the last 120s of volume that was sell-initiated
-#   vol_120_ratio     vol_120 / median vol_120 over the baseline window
+# Features against the DAILY REFERENCE (src/reference.py) - "normal for this
+# hour of day, over the previous 7 days", rebuilt once a day, never using the
+# day being scored:
+#   ret_60_ref_z        60s return / typical 1-minute return at this hour
+#   vol_60_ref_ratio    last 60s volume / typical 1-minute volume at this hour
+#   vol_120_ref_ratio   last 120s volume / typical 2 minutes at this hour
 #
-# Baselines exclude the most recent window, so a move doesn't inflate the
-# "normal" it's being compared against while it's still happening.
+# Features against a rolling 30-minute baseline (the first version; kept for
+# comparison, see the README for why they were too noisy):
+#   ret_60_z, vol_60_ratio, vol_120_ratio
+#
+# Plus: ret_60 (60s return), vol_60 (60s volume), sell_share_120 (share of the
+# last 120s of volume that was sell-initiated).
+#
+# Calibrated on 5 days (2025-09-24, 10-01, 10-04, 10-07, 10-10) to give 0-3
+# incidents on an ordinary day; checked on 6 days it had never seen.
 
 features:
-  baseline_window_s: 1800   # what "normal" means: the last 30 minutes
-  warmup_s: 600             # no rule fires until 10 minutes of baseline exist
+  baseline_window_s: 1800   # rolling-baseline features only
+  warmup_s: 600
 
 rules:
+  # The symptom: price moved far more than it normally does at this hour.
+  # The only rule that opens incidents.
   price_shock:
-    description: 60-second price move far outside the recent normal range
-    condition: abs(ret_60_z) > 4
+    description: 60-second price move over 10x the typical 1-minute move at this hour
+    condition: abs(ret_60_ref_z) > 10
     severity: high
     clear_after_s: 60       # stays active until false for this long (no flapping)
 
+  # Context: recorded always, attached to an incident as evidence if one is
+  # open or opens within context_lookback_s. On their own they fire several
+  # times a day without the price doing anything much - crypto volume is
+  # spiky and one-sided minutes are common.
   volume_burst:
-    description: Last minute's volume far above the recent norm
-    condition: vol_60_ratio > 5
+    description: Last minute's volume over 20x the typical minute at this hour
+    condition: vol_60_ref_ratio > 20
     severity: medium
     clear_after_s: 60
+    opens_incident: false
 
   one_sided_flow:
-    description: Buying or selling dominates the tape on meaningful volume
-    condition: (sell_share_120 > 0.8 or sell_share_120 < 0.2) and vol_120_ratio > 1.5
+    description: Over 80% of 2 minutes' volume on one side, on 10x typical volume
+    condition: (sell_share_120 > 0.8 or sell_share_120 < 0.2) and vol_120_ref_ratio > 10
     severity: medium
     clear_after_s: 60
+    opens_incident: false
 
 # Alert grouping - the alert manager's job. One market move should be one
-# incident, not a page per rule per second: an alert joins its symbol's open
-# incident if there is one, and opens a new incident otherwise.
+# incident, not a page per rule per second.
 incidents:
-  resolve_after_s: 300      # an incident resolves after this long with no rule active on its symbol
+  resolve_after_s: 900      # resolves after 15 minutes with no incident-opening rule active
+  context_lookback_s: 300   # context alerts up to 5 minutes before the open join the incident

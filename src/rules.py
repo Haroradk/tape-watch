@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src import reference
+
 RULES_PATH = Path(__file__).parent.parent / "rules.yml"
 
 DDL = """
@@ -63,7 +65,7 @@ CREATE TABLE IF NOT EXISTS ops.incidents (
     resolved_at         TIMESTAMP,
     rules               VARCHAR[],
     alert_count         INTEGER,
-    price_at_open       DOUBLE,
+    price_at_open       DOUBLE,      -- price just before the move that opened it (60s before)
     price_low           DOUBLE,
     price_high          DOUBLE,
     price_last          DOUBLE,
@@ -105,8 +107,11 @@ def load_rules(path: Path = RULES_PATH) -> tuple:
 
 # ---------------------------------------------------------------- features
 
-def compute_features(buf: pd.DataFrame, baseline_s: int, warmup_s: int) -> pd.DataFrame:
-    """Features for every second in a dense per-symbol buffer (index = second)."""
+def compute_features(buf: pd.DataFrame, baseline_s: int, warmup_s: int, ref: pd.DataFrame = None) -> pd.DataFrame:
+    """Features for every second in a dense per-symbol buffer (index = second).
+
+    ref: this symbol's daily reference profile, indexed by hour of day
+    (src/reference.py). Without it, the *_ref_* features are NaN."""
     f = pd.DataFrame(index=buf.index)
     close, vol, sell = buf["close"], buf["volume"], buf["sell_volume"]
 
@@ -122,6 +127,17 @@ def compute_features(buf: pd.DataFrame, baseline_s: int, warmup_s: int) -> pd.Da
     vol_120 = vol.rolling(120).sum()
     f["sell_share_120"] = sell.rolling(120).sum() / vol_120.replace(0, np.nan)
     f["vol_120_ratio"] = vol_120 / baseline(vol_120, 120, "median").replace(0, np.nan)
+
+    # Against the slow daily reference: "normal for this hour, over the last week".
+    if ref is not None:
+        hours = buf.index.hour
+        vol_ref = ref["vol_1m_median"].reindex(hours).to_numpy()
+        ret_ref = ref["ret_1m_std"].reindex(hours).to_numpy()
+    else:
+        vol_ref = ret_ref = np.nan
+    f["ret_60_ref_z"] = f["ret_60"] / ret_ref
+    f["vol_60_ref_ratio"] = f["vol_60"] / vol_ref
+    f["vol_120_ref_ratio"] = vol_120 / (2 * vol_ref)
     return f
 
 
@@ -151,6 +167,8 @@ class Incident:
     price_last: float = None
     max_abs_ret_60_z: float = 0.0
     max_vol_60_ratio: float = 0.0
+    max_abs_ret_60_ref_z: float = 0.0
+    max_vol_60_ref_ratio: float = 0.0
     max_sell_share_120: float = None
     min_sell_share_120: float = None
 
@@ -161,6 +179,8 @@ class Incident:
         self.price_high = price if self.price_high is None else max(self.price_high, price)
         for attr, value, fn in (("max_abs_ret_60_z", abs(row["ret_60_z"]), max),
                                 ("max_vol_60_ratio", row["vol_60_ratio"], max),
+                                ("max_abs_ret_60_ref_z", abs(row["ret_60_ref_z"]), max),
+                                ("max_vol_60_ref_ratio", row["vol_60_ref_ratio"], max),
                                 ("max_sell_share_120", row["sell_share_120"], max),
                                 ("min_sell_share_120", row["sell_share_120"], min)):
             if pd.notna(value):
@@ -173,13 +193,17 @@ def _clean(value):
 
 
 class RuleEngine:
-    def __init__(self, run_id: str, allowed_lateness_s: float, config: dict):
+    def __init__(self, run_id: str, allowed_lateness_s: float, config: dict, reference: pd.DataFrame = None):
         self.key = [run_id, float(allowed_lateness_s)]
+        # symbol -> profile indexed by hour, from reference.get_profile()
+        self.reference = ({sym: grp.set_index("hour") for sym, grp in reference.groupby("symbol")}
+                          if reference is not None else {})
         self.cfg = config
         self.rules = config["rules"]
         self.baseline_s = int(config["features"]["baseline_window_s"])
         self.warmup_s = int(config["features"]["warmup_s"])
         self.resolve_after = timedelta(seconds=config["incidents"]["resolve_after_s"])
+        self.context_lookback = timedelta(seconds=config["incidents"].get("context_lookback_s", 300))
         self.keep = timedelta(seconds=self.baseline_s + 600)
 
         self.buffers = {}        # symbol -> dense DataFrame of close/volume/sell_volume
@@ -215,7 +239,7 @@ class RuleEngine:
             dense["close"] = dense["close"].ffill()
             dense[["volume", "sell_volume"]] = dense[["volume", "sell_volume"]].fillna(0.0)
 
-            feats = compute_features(dense, self.baseline_s, self.warmup_s)
+            feats = compute_features(dense, self.baseline_s, self.warmup_s, self.reference.get(symbol))
             last = self.last_eval.get(symbol)
             fresh = feats if last is None else feats.loc[feats.index > last]
             if not fresh.empty:
@@ -238,21 +262,23 @@ class RuleEngine:
     def _step(self, t: datetime, row: pd.Series, detected: datetime) -> None:
         symbol = row["symbol"]
         inc = self.open_incident.get(symbol)
-        any_active = False
+        any_active = False  # any incident-opening rule active on this symbol
 
         for rule_name, rule in self.rules.items():
+            opens = rule.get("opens_incident", True)
             st = self.states.setdefault((rule_name, symbol), RuleState())
             if row[f"_{rule_name}"]:
                 st.last_true = t
                 if not st.active:
                     st.active = True
-                    inc = inc or self._open(symbol, t, row, detected)
+                    if opens:
+                        inc = inc or self._open(symbol, t, row, detected)
                     st.alert = self._fire(rule_name, rule, symbol, t, row, detected, inc)
             elif st.active and t - st.last_true >= timedelta(seconds=rule.get("clear_after_s", 60)):
                 st.active = False
                 st.alert["cleared_at"] = t
                 self.changed_alerts.add(st.alert["alert_no"])
-            any_active = any_active or st.active
+            any_active = any_active or (st.active and opens)
 
         if inc is None:
             return
@@ -267,24 +293,43 @@ class RuleEngine:
             del self.open_incident[symbol]
 
     def _open(self, symbol, t, row, detected) -> Incident:
-        inc = Incident(len(self.incidents) + 1, symbol, t, detected, float(row["close"]), last_active_at=t)
+        # The shock fires *after* the 60s move, so the incident's reference
+        # price is where the market was before it: close / (1 + ret_60).
+        before = float(row["close"]) / (1 + row["ret_60"]) if pd.notna(row["ret_60"]) else float(row["close"])
+        inc = Incident(len(self.incidents) + 1, symbol, t, detected, before, last_active_at=t)
         self.incidents.append(inc)
         self.open_incident[symbol] = inc
         self.events.append([inc.incident_no, "opened", t, detected, None])
+        # Context alerts from the lead-up belong to this incident too: that's
+        # how "volume moved before price" ends up in the evidence.
+        for alert in reversed(self.alerts):
+            if alert["fired_at"] < t - self.context_lookback:
+                break
+            if alert["symbol"] == symbol and alert["incident_no"] is None:
+                self._attach(alert, inc)
         return inc
 
+    def _attach(self, alert: dict, inc: Incident) -> None:
+        alert["incident_no"] = inc.incident_no
+        inc.alert_count += 1
+        if alert["rule"] not in inc.rules:
+            inc.rules.append(alert["rule"])
+        self.events.append([inc.incident_no, "alert", alert["fired_at"], alert["detected_at"], alert["rule"]])
+        self.changed_alerts.add(alert["alert_no"])
+
     def _fire(self, rule_name, rule, symbol, t, row, detected, inc) -> dict:
+        """Record an alert. Without an open incident it stays standalone - still
+        kept, because signal research needs the alerts that led nowhere too."""
         features = {k: _clean(round(float(row[k]), 6)) for k in
-                    ("close", "ret_60", "ret_60_z", "vol_60", "vol_60_ratio", "sell_share_120", "vol_120_ratio")}
-        alert = {"alert_no": len(self.alerts) + 1, "incident_no": inc.incident_no, "symbol": symbol,
+                    ("close", "ret_60", "ret_60_z", "vol_60", "vol_60_ratio", "sell_share_120", "vol_120_ratio",
+                     "ret_60_ref_z", "vol_60_ref_ratio", "vol_120_ref_ratio")}
+        alert = {"alert_no": len(self.alerts) + 1, "incident_no": None, "symbol": symbol,
                  "rule": rule_name, "severity": rule.get("severity"), "fired_at": t, "detected_at": detected,
                  "cleared_at": None, "features": json.dumps(features)}
         self.alerts.append(alert)
-        inc.alert_count += 1
-        if rule_name not in inc.rules:
-            inc.rules.append(rule_name)
-        self.events.append([inc.incident_no, "alert", t, detected, rule_name])
         self.changed_alerts.add(alert["alert_no"])
+        if inc is not None:
+            self._attach(alert, inc)
         return alert
 
     # ------------------------------------------------------------ persistence
@@ -295,6 +340,7 @@ class RuleEngine:
         if self.changed_alerts:
             nos = sorted(self.changed_alerts)
             df = pd.DataFrame([self.alerts[n - 1] for n in nos])
+            df["incident_no"] = df["incident_no"].astype("Int64")  # standalone alerts have none
             df.insert(0, "allowed_lateness_s", key[1])
             df.insert(0, "run_id", key[0])
             _replace(con, "ops.alerts", "alert_no", nos, key, df)
@@ -306,7 +352,8 @@ class RuleEngine:
                 "last_active_at": i.last_active_at, "resolved_at": i.resolved_at, "rules": list(i.rules),
                 "alert_count": i.alert_count, "price_at_open": i.price_at_open, "price_low": i.price_low,
                 "price_high": i.price_high, "price_last": i.price_last, "max_abs_ret_60_z": i.max_abs_ret_60_z,
-                "max_vol_60_ratio": i.max_vol_60_ratio, "max_sell_share_120": i.max_sell_share_120,
+                "max_vol_60_ratio": i.max_vol_60_ratio, "max_abs_ret_60_ref_z": i.max_abs_ret_60_ref_z,
+                "max_vol_60_ref_ratio": i.max_vol_60_ref_ratio, "max_sell_share_120": i.max_sell_share_120,
                 "min_sell_share_120": i.min_sell_share_120, "agent_status": "pending",
             } for i in (self.incidents[n - 1] for n in nos)])
             _replace(con, "ops.incidents", "incident_no", nos, key, df)
@@ -327,7 +374,7 @@ def _replace(con, table: str, id_col: str, ids: list, key: list, df: pd.DataFram
     con.execute(f"DELETE FROM {table} WHERE run_id = ? AND allowed_lateness_s = ? AND list_contains(?, {id_col})",
                 key + [ids])
     con.register("rows", df)
-    con.execute(f"INSERT INTO {table} SELECT * FROM rows")
+    con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM rows")
     con.unregister("rows")
 
 
@@ -342,8 +389,16 @@ ORDER BY bar_start, symbol
 """
 
 
+MIGRATIONS = [
+    "ALTER TABLE ops.incidents ADD COLUMN IF NOT EXISTS max_abs_ret_60_ref_z DOUBLE",
+    "ALTER TABLE ops.incidents ADD COLUMN IF NOT EXISTS max_vol_60_ref_ratio DOUBLE",
+]
+
+
 def _reset(con, key: list) -> None:
     con.execute(DDL)
+    for sql in MIGRATIONS:
+        con.execute(sql)
     for table in ("alerts", "incidents", "incident_events", "rule_runs"):
         con.execute(f"DELETE FROM ops.{table} WHERE run_id = ? AND allowed_lateness_s = ?", key)
 
@@ -354,10 +409,18 @@ def _record(con, engine: RuleEngine, started: datetime, mode: str, rules_text: s
                               len(engine.alerts), len(engine.incidents), rules_text])
 
 
-def evaluate(con, run_id: str, allowed_lateness_s: float) -> RuleEngine:
+def _reference_for(con, run_id: str) -> pd.DataFrame:
+    """The daily reference profile for the day this run replays."""
+    trade_date, symbols = con.execute(
+        "SELECT trade_date, symbols FROM bronze.replay_runs WHERE run_id = ?", [run_id]).fetchone()
+    return reference.get_profile(con, list(symbols), trade_date)
+
+
+def evaluate(con, run_id: str, allowed_lateness_s: float, config: dict = None) -> RuleEngine:
     """Offline: run the rules over a finished silver build."""
-    config, text = load_rules()
-    engine = RuleEngine(run_id, allowed_lateness_s, config)
+    loaded, text = load_rules()
+    config = config or loaded
+    engine = RuleEngine(run_id, allowed_lateness_s, config, _reference_for(con, run_id))
     started = datetime.utcnow()
     _reset(con, engine.key)
     engine.ingest(con.execute(BARS_SQL, engine.key + [datetime(1970, 1, 1)]).df())
@@ -369,7 +432,9 @@ def evaluate(con, run_id: str, allowed_lateness_s: float) -> RuleEngine:
 def follow(con, run_id: str, allowed_lateness_s: float, poll_s: float = 0.25) -> RuleEngine:
     """Live: evaluate bars as silver publishes them, until silver's build is recorded."""
     config, text = load_rules()
-    engine = RuleEngine(run_id, allowed_lateness_s, config)
+    while not con.execute("SELECT count(*) FROM bronze.replay_runs WHERE run_id = ?", [run_id]).fetchone()[0]:
+        time.sleep(poll_s)  # the replayer registers the run once its source is loaded
+    engine = RuleEngine(run_id, allowed_lateness_s, config, _reference_for(con, run_id))
     started = datetime.utcnow()
     _reset(con, engine.key)
     last_bar = datetime(1970, 1, 1)
