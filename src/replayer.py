@@ -5,8 +5,10 @@ the wall clock. Every `tick` wall-seconds it emits, as one micro-batch, every
 trade whose arrival time has passed on the simulated clock.
 
 Arrival time normally equals event time. With late_fraction > 0, a random
-share of trades is held back by late_delay_s - they still carry their true
-event_time, they just show up later, the way a real feed hiccups.
+share of trades is held back by a random delay (exponential, mean
+late_delay_s) - they still carry their true event_time, they just show up
+later, the way a real feed hiccups. Random rather than fixed delays mean no
+single watermark setting catches every late trade, which is realistic.
 """
 
 import time
@@ -62,7 +64,8 @@ def assign_arrivals(df: pd.DataFrame, late_fraction: float, late_delay_s: float,
     """Give every trade an arrival time and sort the tape into arrival order."""
     rng = np.random.default_rng(seed)
     is_late = rng.random(len(df)) < late_fraction
-    df["arrival_us"] = df["event_us"] + np.where(is_late, int(late_delay_s * 1_000_000), 0)
+    delay_us = rng.exponential(late_delay_s * 1_000_000, len(df)).astype("int64")
+    df["arrival_us"] = df["event_us"] + np.where(is_late, delay_us, 0)
     # The stream carries no "I'm late" flag - that is the point. We only print
     # the count so the run summary can be checked against what silver detects.
     df.attrs["late_injected"] = int(is_late.sum())
