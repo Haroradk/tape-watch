@@ -25,7 +25,7 @@ The default day is **2025-10-10**, the big liquidation evening: BTC traded 115k 
 | 3 | YAML rules → alerts → incidents, live on MotherDuck as three processes | done |
 | 3b | Daily reference profile, rules recalibrated on 5 days and checked on 6 unseen days | done |
 | 4 | Daily batch job (GitHub Actions), bronze retention | done |
-| 5 | Daily briefing: SQL evidence per incident + one Gemini call per day | next |
+| 5 | Daily briefing: SQL evidence per incident + one Gemini call per day | in progress: evidence done, LLM call not yet verified, not wired into the daily job |
 | 6 | Streamlit dashboard, updated daily | |
 | 7 | Signal research: do these patterns predict anything? Backtests on history only | |
 

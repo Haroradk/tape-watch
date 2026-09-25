@@ -4,3 +4,5 @@ pyarrow
 pyyaml
 requests
 python-dotenv
+google-genai
+tenacity

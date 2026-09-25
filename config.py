@@ -34,6 +34,13 @@ DB_PATH = str(PROJECT_DIR / "data" / "tape.duckdb")
 MOTHERDUCK_TOKEN = os.environ.get("MOTHERDUCK_TOKEN")
 MOTHERDUCK_DATABASE = os.environ.get("MOTHERDUCK_DATABASE", "tape")
 
+# The daily briefing's one LLM call. Free-tier limits are counted per model,
+# and the weather projects use gemini-3.6-flash (agent) and
+# gemini-3.1-flash-lite (ETL) on the same key, so this uses a third model and
+# never competes for their quota.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_BRIEFING_MODEL = os.environ.get("GEMINI_BRIEFING_MODEL", "gemini-3.5-flash")
+
 
 def get_connection(read_only: bool = False) -> duckdb.DuckDBPyConnection:
     """MotherDuck when MOTHERDUCK_TOKEN is set (cloud), else the local file."""
