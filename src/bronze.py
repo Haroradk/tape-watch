@@ -56,3 +56,5 @@ def ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
     # wall clock - a Mac that sleeps mid-run pauses the replayer's clock but
     # not the wall clock, and the two drift apart by hours.
     con.execute("ALTER TABLE bronze.replay_runs ADD COLUMN IF NOT EXISTS sim_clock TIMESTAMP")
+    # Set when retention deletes the run's raw trades (src/daily.py).
+    con.execute("ALTER TABLE bronze.replay_runs ADD COLUMN IF NOT EXISTS bronze_purged_at TIMESTAMP")

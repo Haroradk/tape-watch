@@ -132,6 +132,7 @@ ORDER BY bar_start, symbol
 """
 
 CLOSE_1M_SQL = """
+SELECT * RENAME (minute AS bar_start) FROM (
 SELECT run_id, allowed_lateness_s, symbol, time_bucket(INTERVAL 1 MINUTE, bar_start) AS minute,
        arg_min(open, bar_start) AS open, max(high) AS high, min(low) AS low, arg_max(close, bar_start) AS close,
        (sum(quote_volume) / sum(volume))::DECIMAL(18, 8) AS vwap,
@@ -142,6 +143,7 @@ FROM recent_1s
 WHERE bar_start >= ? AND bar_start < ?
 GROUP BY ALL
 ORDER BY minute, symbol
+)
 """
 
 
@@ -181,8 +183,8 @@ class BarBuilder:
             # 1. Anything for a bar the previous watermark already closed is too late.
             if self.watermark is not None:
                 out["late_trades"] = db.execute(f"""
-                    SELECT ?::VARCHAR, ?::DOUBLE, symbol, agg_trade_id, quantity, event_time, arrival_time,
-                           ?::TIMESTAMP
+                    SELECT ?::VARCHAR AS run_id, ?::DOUBLE AS allowed_lateness_s, symbol, agg_trade_id, quantity,
+                           event_time, arrival_time, ?::TIMESTAMP AS watermark_at_arrival
                     FROM batch WHERE {BAR_END} <= ?
                 """, self.key + [self.watermark, self.watermark]).fetch_arrow_table()
                 self.dropped += out["late_trades"].num_rows
@@ -228,7 +230,7 @@ def write_output(con, outputs: list) -> None:
         parts = [o[table] for o in outputs if table in o and o[table].num_rows]
         if parts:
             con.register("out", pa.concat_tables(parts))
-            con.execute(f"INSERT INTO silver.{table} SELECT * FROM out")
+            con.execute(f"INSERT INTO silver.{table} BY NAME SELECT * FROM out")
             con.unregister("out")
 
 
@@ -239,7 +241,8 @@ def _reset(con, key: list) -> None:
 
 
 def _record_build(con, builder: BarBuilder) -> None:
-    con.execute("INSERT INTO silver.builds VALUES (?, ?, ?, ?, ?, ?)",
+    con.execute("INSERT INTO silver.builds (run_id, allowed_lateness_s, built_at, batches, trades_accepted, trades_dropped) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 builder.key + [datetime.utcnow(), builder.batches, builder.accepted, builder.dropped])
 
 

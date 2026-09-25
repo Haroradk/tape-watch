@@ -24,8 +24,8 @@ The default day is **2025-10-10**, the big liquidation evening: BTC traded 115k 
 | 2 | Silver 1s/1m bars (windowing, watermarks, late events) | done |
 | 3 | YAML rules → alerts → incidents, live on MotherDuck as three processes | done |
 | 3b | Daily reference profile, rules recalibrated on 5 days and checked on 6 unseen days | done |
-| 4 | Daily batch job (GitHub Actions), bronze retention | next |
-| 5 | Daily briefing: SQL evidence per incident + one Gemini call per day | |
+| 4 | Daily batch job (GitHub Actions), bronze retention | done |
+| 5 | Daily briefing: SQL evidence per incident + one Gemini call per day | next |
 | 6 | Streamlit dashboard, updated daily | |
 | 7 | Signal research: do these patterns predict anything? Backtests on history only | |
 
@@ -184,7 +184,48 @@ comparison found one mismatch per coin, at 23:59: the day had been replayed with
 and since the window end is exclusive, the last second's trades were dropped. Full days now use
 `--end 24:00`.
 
-## Running live: three processes on MotherDuck
+## Production: the daily job
+
+Binance publishes each day's files around 01:30–03:00 UTC the following night, so the production
+pipeline is a **batch job**, not a stream. `run_daily.py` (GitHub Actions, `.github/workflows/daily.yml`,
+06:23 UTC with a 09:23 retry) processes yesterday end to end with the same code the live demo uses:
+
+1. replay the full day as a fast backfill into bronze (no sleeping, 10 simulated seconds per micro-batch)
+2. build silver bars
+3. rebuild the reference profile from the previous 7 days and evaluate the rules
+4. reconcile: every 1-minute bar against Binance's own candle
+5. retention: delete raw trades (bronze) for days more than 7 days old. Silver bars, alerts and
+   incidents are small and kept forever, and raw trades can always be downloaded again.
+
+`ops.daily_runs` is the job's audit log: status, trade/alert/incident counts, how many minutes matched
+Binance, rows purged, the git commit the job ran, and the error if it failed. It's also the pointer to
+the *official* run per day (the latest completed one). Re-running a day with `--force` creates a new
+run and moves the pointer; nothing is overwritten in place.
+
+Safeguards:
+- **Idempotent.** Days with an official run are skipped, which is why the 09:23 retry is harmless.
+- **Loud failure.** A day whose files aren't published yet is recorded as `source_missing`, and the
+  job exits non-zero. A failed retry run opens a GitHub issue. The first scheduled attempt doesn't,
+  because Binance is sometimes just late.
+- **No silent local fallback in CI.** Without `MOTHERDUCK_TOKEN` the code would write to a local
+  DuckDB file, which on a CI runner disappears with the machine, so the job refuses to start.
+
+A full ordinary day takes about 1.5 minutes: 1–3M trades, reconciled against 2,880 Binance candles.
+The first week (backfilled 2026-09-18 → 09-24) had 3, 1, 1, **7**, 0, 1, 0 incidents per day
+(`ops.daily_runs`). The 7 were on 2026-09-21, a genuinely volatile day (BTC's high-low range was 8.1%,
+one incident a +2.3% move at 38x the normal size for that hour). Every minute of every day matched
+Binance's candles exactly.
+
+```bash
+python run_daily.py                          # yesterday
+python run_daily.py --date 2026-09-24 --days 7   # backfill a week (skips done days)
+python run_daily.py --date 2026-09-24 --force    # re-run a day
+```
+
+Setup: add `MOTHERDUCK_TOKEN` as a repository secret (Settings → Secrets and variables → Actions).
+The Actions tab has a "Run workflow" button with date / days / force inputs.
+
+## Demo: running live as three processes on MotherDuck
 
 ```
 replay.py --run-id X            -> bronze.trade_events         (writes each micro-batch)
@@ -253,6 +294,10 @@ python -c "from config import get_connection; print(get_connection(read_only=Tru
   working out "now" from the wall clock, so it computed that alerts were detected four hours late.
   The fix: the replayer publishes its simulated clock as a heartbeat (`bronze.replay_runs.sim_clock`),
   and consumers read "now" from the producer instead of rebuilding it. Also: `caffeinate -i`.
+- **Positional inserts break when a table grows.** Retention added a `bronze_purged_at` column, and
+  the replayer's `INSERT ... VALUES (?, ?, ...)` broke on every new run. The first 7-day backfill
+  failed on all 6 days, correctly recorded as `failed` with the error in `ops.daily_runs`. All inserts
+  now name their columns (`BY NAME` or a column list), and each table's columns are defined in one place.
 - **Sleep out the rest of the tick, not a whole tick.** The replayer first slept a full tick *after*
   each MotherDuck insert, so batches drifted to ~40 simulated seconds instead of 30.
 
@@ -260,6 +305,9 @@ python -c "from config import get_connection; print(get_connection(read_only=Tru
 
 ```
 config.py            symbols, data URL, default day, allowed lateness, get_connection()
+run_daily.py         the daily job (production): yesterday, or a range of days
+src/daily.py         daily job steps, ops.daily_runs audit log, bronze retention
+.github/workflows/daily.yml   runs the daily job on GitHub Actions
 live.py              runs replayer + silver + rules as three processes for one run
 replay.py            CLI: replay a day into bronze
 src/download.py      fetch daily aggTrades / 1m klines zip + .CHECKSUM, verify sha256, unzip

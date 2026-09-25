@@ -362,7 +362,7 @@ class RuleEngine:
             df.insert(0, "allowed_lateness_s", key[1])
             df.insert(0, "run_id", key[0])
             con.register("ev", df)
-            con.execute("INSERT INTO ops.incident_events SELECT * FROM ev")
+            con.execute("INSERT INTO ops.incident_events BY NAME SELECT * FROM ev")
             con.unregister("ev")
         self.changed_alerts.clear()
         self.changed_incidents.clear()
@@ -404,7 +404,9 @@ def _reset(con, key: list) -> None:
 
 
 def _record(con, engine: RuleEngine, started: datetime, mode: str, rules_text: str) -> None:
-    con.execute("INSERT INTO ops.rule_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    con.execute("""INSERT INTO ops.rule_runs (run_id, allowed_lateness_s, started_at, finished_at, mode,
+                                              seconds_evaluated, alerts, incidents, rules_yml)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 engine.key + [started, datetime.utcnow(), mode, engine.seconds_evaluated,
                               len(engine.alerts), len(engine.incidents), rules_text])
 

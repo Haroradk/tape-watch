@@ -90,7 +90,8 @@ def assign_arrivals(tape: pa.Table, late_fraction: float, late_delay_s: float, s
 
 
 INSERT_SQL = """
-INSERT INTO bronze.trade_events
+INSERT INTO bronze.trade_events (run_id, batch_id, symbol, agg_trade_id, price, quantity, first_trade_id,
+                                 last_trade_id, is_buyer_maker, event_time, arrival_time, ingested_at)
 SELECT ?, batch_id, symbol, agg_trade_id, price, quantity, first_trade_id, last_trade_id,
        is_buyer_maker, make_timestamp(event_us), make_timestamp(arrival_clock_us), ?
 FROM batch
@@ -132,11 +133,15 @@ def replay(
                                           late_fraction, late_delay_s)
     arrivals = tape["arrival_us"].to_numpy()
     print(f"Loaded {len(tape):,} trades for {', '.join(symbols)} "
-          f"{window_start:%H:%M}-{window_end:%H:%M} UTC ({late_injected:,} will arrive late)")
+          f"{window_start:%Y-%m-%d %H:%M} to {window_end:%Y-%m-%d %H:%M} UTC ({late_injected:,} will arrive late)")
 
     run_id = run_id or new_run_id()
     con.execute(
-        "INSERT INTO bronze.replay_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'running', 0, ?)",
+        # Named columns: the table has gained columns over time (sim_clock,
+        # bronze_purged_at), and a positional VALUES list breaks every time.
+        """INSERT INTO bronze.replay_runs (run_id, trade_date, symbols, window_start, window_end, speed,
+               late_fraction, late_delay_s, started_at, status, events_emitted, sim_clock)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, ?)""",
         [run_id, date, symbols, window_start, window_end, speed, late_fraction, late_delay_s, datetime.utcnow(),
          window_start],
     )

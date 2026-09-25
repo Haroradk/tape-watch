@@ -1,0 +1,67 @@
+name: daily
+
+# Process yesterday's trading day. Binance publishes a day's files around
+# 01:30-03:00 UTC; the second run is a retry that does nothing if the first
+# already succeeded (run_daily.py skips days that have an official run).
+# Off-peak minutes on purpose: GitHub delays scheduled runs most at the top
+# of the hour (learned in the weather-etl-pipeline repo).
+on:
+  schedule:
+    - cron: "23 6 * * *"
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Trading day YYYY-MM-DD (default: yesterday UTC)"
+        required: false
+      days:
+        description: "Number of days ending at date"
+        required: false
+        default: "1"
+      force:
+        description: "Re-run days that already have an official run"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write # lets the failure step open an issue
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run daily job
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          MOTHERDUCK_DATABASE: tape
+        run: |
+          args="--days ${{ github.event.inputs.days || '1' }} --delete-raw"
+          if [ -n "${{ github.event.inputs.date }}" ]; then args="$args --date ${{ github.event.inputs.date }}"; fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then args="$args --force"; fi
+          python -u -W ignore run_daily.py $args
+
+      # Not on the first scheduled attempt: if Binance is late publishing,
+      # the retry a few hours later will usually pick it up.
+      - name: Open an issue on failure
+        if: failure() && github.event.schedule != '23 6 * * *'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Daily job failed: run #${context.runNumber}`,
+              body: `The tape-watch daily job failed. ops.daily_runs has the status and error per day. Logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })

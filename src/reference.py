@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS reference.profile (
 
 KLINES_SQL = """
 SELECT '{symbol}' AS symbol,
-       make_timestamp(CASE WHEN open_time > 100000000000000 THEN open_time ELSE open_time * 1000 END),
+       make_timestamp(CASE WHEN open_time > 100000000000000 THEN open_time ELSE open_time * 1000 END) AS open_time,
        open, high, low, close, volume, quote_volume, trade_count, taker_buy_volume
 FROM read_csv('{path}', header = false, columns = {{
     'open_time': 'BIGINT', 'open': 'DECIMAL(18,8)', 'high': 'DECIMAL(18,8)', 'low': 'DECIMAL(18,8)',
@@ -100,7 +100,7 @@ def load_klines(con, symbols: list, day: Date) -> None:
         con.execute("DELETE FROM reference.klines_1m WHERE symbol = ? AND open_time >= ? AND open_time < ?",
                     [symbol, start, start + timedelta(days=1)])
         con.register("k", rows)
-        con.execute("INSERT INTO reference.klines_1m SELECT * FROM k")
+        con.execute("INSERT INTO reference.klines_1m BY NAME SELECT * FROM k")
         con.unregister("k")
 
 
@@ -120,7 +120,7 @@ def build_profile(con, symbols: list, as_of: Date) -> pd.DataFrame:
     profile = con.execute(PROFILE_SQL, [symbols, first, as_of, as_of, datetime.utcnow()]).df()
     con.execute("DELETE FROM reference.profile WHERE as_of_date = ? AND symbol = ANY(?)", [as_of, symbols])
     con.register("p", profile)
-    con.execute("INSERT INTO reference.profile SELECT * FROM p")
+    con.execute("INSERT INTO reference.profile BY NAME SELECT * FROM p")
     con.unregister("p")
     return profile
 
@@ -145,7 +145,10 @@ def reconcile(con, run_id: str, allowed_lateness_s: float) -> pd.DataFrame:
                count(*) FILTER (WHERE b.close = k.close AND b.open = k.open
                                   AND b.high = k.high AND b.low = k.low)        AS ohlc_exact,
                count(*) FILTER (WHERE b.volume = k.volume)                      AS volume_exact,
-               count(*) FILTER (WHERE b.volume - b.sell_volume = k.taker_buy_volume) AS buy_volume_exact
+               count(*) FILTER (WHERE b.volume - b.sell_volume = k.taker_buy_volume) AS buy_volume_exact,
+               count(*) FILTER (WHERE b.close = k.close AND b.open = k.open AND b.high = k.high AND b.low = k.low
+                                  AND b.volume = k.volume
+                                  AND b.volume - b.sell_volume = k.taker_buy_volume)  AS all_exact
         FROM silver.bars_1m b JOIN reference.klines_1m k ON k.symbol = b.symbol AND k.open_time = b.bar_start
         WHERE b.run_id = ? AND b.allowed_lateness_s = ?
         GROUP BY 1 ORDER BY 1
