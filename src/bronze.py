@@ -51,3 +51,8 @@ CREATE TABLE IF NOT EXISTS bronze.trade_events (
 
 def ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(DDL)
+    # The replayer's heartbeat: its simulated clock as of the last batch it
+    # wrote. Consumers read "now" from here instead of deriving it from the
+    # wall clock - a Mac that sleeps mid-run pauses the replayer's clock but
+    # not the wall clock, and the two drift apart by hours.
+    con.execute("ALTER TABLE bronze.replay_runs ADD COLUMN IF NOT EXISTS sim_clock TIMESTAMP")

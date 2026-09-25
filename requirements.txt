@@ -1,4 +1,6 @@
 duckdb
 pandas
+pyarrow
+pyyaml
 requests
 python-dotenv

@@ -19,12 +19,17 @@ BINANCE_DATA_URL = "https://data.binance.vision/data/spot/daily/aggTrades"
 # rules engine will definitely have something to find.
 DEFAULT_DATE = "2025-10-10"
 
+# How long silver waits for late trades before closing a bar - see the
+# lateness experiment in the README for where 10s comes from.
+ALLOWED_LATENESS_S = 10.0
+
 PROJECT_DIR = Path(__file__).parent
 RAW_DIR = PROJECT_DIR / "data" / "raw"
 DB_PATH = str(PROJECT_DIR / "data" / "tape.duckdb")
 
-# Not used yet - the replayer writes locally first. Same pattern as the
-# weather projects when we move the warehouse to MotherDuck.
+# The warehouse lives on MotherDuck when a token is set, so the replayer,
+# silver and rules can run as separate processes (a local DuckDB file only
+# allows one writing process). Without a token everything uses the local file.
 MOTHERDUCK_TOKEN = os.environ.get("MOTHERDUCK_TOKEN")
 MOTHERDUCK_DATABASE = os.environ.get("MOTHERDUCK_DATABASE", "tape")
 

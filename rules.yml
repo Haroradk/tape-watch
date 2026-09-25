@@ -1,0 +1,46 @@
+# Surveillance rules, evaluated every second per symbol over silver 1s bars.
+#
+# The engine builds a dense 1-second series per symbol (seconds with no trades
+# get volume 0 and the previous close) and computes the features below. Rules
+# are conditions over those features - pandas expressions, so thresholds can
+# be tuned here without touching code.
+#
+# Features (all computed per second t):
+#   ret_60            price return over the last 60s: close_t / close_(t-60) - 1
+#   ret_60_z          ret_60 divided by the std of ret_60 over the baseline window
+#   vol_60            base-asset volume traded in the last 60s
+#   vol_60_ratio      vol_60 / median vol_60 over the baseline window
+#   sell_share_120    share of the last 120s of volume that was sell-initiated
+#   vol_120_ratio     vol_120 / median vol_120 over the baseline window
+#
+# Baselines exclude the most recent window, so a move doesn't inflate the
+# "normal" it's being compared against while it's still happening.
+
+features:
+  baseline_window_s: 1800   # what "normal" means: the last 30 minutes
+  warmup_s: 600             # no rule fires until 10 minutes of baseline exist
+
+rules:
+  price_shock:
+    description: 60-second price move far outside the recent normal range
+    condition: abs(ret_60_z) > 4
+    severity: high
+    clear_after_s: 60       # stays active until false for this long (no flapping)
+
+  volume_burst:
+    description: Last minute's volume far above the recent norm
+    condition: vol_60_ratio > 5
+    severity: medium
+    clear_after_s: 60
+
+  one_sided_flow:
+    description: Buying or selling dominates the tape on meaningful volume
+    condition: (sell_share_120 > 0.8 or sell_share_120 < 0.2) and vol_120_ratio > 1.5
+    severity: medium
+    clear_after_s: 60
+
+# Alert grouping - the alert manager's job. One market move should be one
+# incident, not a page per rule per second: an alert joins its symbol's open
+# incident if there is one, and opens a new incident otherwise.
+incidents:
+  resolve_after_s: 300      # an incident resolves after this long with no rule active on its symbol
